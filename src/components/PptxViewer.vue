@@ -107,6 +107,14 @@
               alt=""
             />
 
+            <!-- Case 1b: Hairline divider / decorative bar.
+                 These shapes are ~1px tall in the source deck; rendering them
+                 at their declared (stretched) height produced huge slabs. -->
+            <div
+              v-else-if="elem.type === 'bar'"
+              class="slide-bar"
+            ></div>
+
             <!-- Case 2: Text Box -->
             <div 
               v-else-if="elem.paragraphs && elem.paragraphs.length > 0" 
@@ -356,9 +364,18 @@ function getElementStyle(elem) {
     top: `${Math.round(elem.y * bh)}px`,
     width: `${Math.round(elem.w * bw)}px`,
     height: elem.h ? `${Math.round(elem.h * bh)}px` : 'auto',
-    boxSizing: 'border-box',
-    overflow: 'hidden'
+    boxSizing: 'border-box'
   };
+
+  // Hairline dividers: draw as a rule of the declared thickness instead of a
+  // stretched box, otherwise a ~1px shape becomes a giant grey slab.
+  if (elem.type === 'bar') {
+    style.height = `${Math.max(1, Math.round((elem.barThickness || 0.002) * bh))}px`;
+    style.backgroundColor = elem.shapeFill || elem.shapeBorder || '#D8D7D0';
+    style.border = 'none';
+    style.overflow = 'visible';
+    return style;
+  }
 
   if (elem.shapeFill) {
     style.backgroundColor = elem.shapeFill;
@@ -367,13 +384,17 @@ function getElementStyle(elem) {
     style.border = `1px solid ${elem.shapeBorder}`;
   }
 
-  // Text boxes must not clip their own content: if the PPTX-declared box is
-  // shorter than the text it holds, let it grow downward instead.
+  // Text boxes must not clip their own content.
+  // BUG FIX: overflow used to be `hidden` on every element, so a large
+  // run (e.g. the 48pt "01" index, whose box is only 46px wide) was sliced
+  // in half. PowerPoint lets text overflow a nowrap box, so we clip nothing
+  // on text elements and only clamp images/decorative shapes.
   if (elem.paragraphs && elem.paragraphs.length > 0) {
     style.height = 'auto';
     style.minHeight = elem.h ? `${Math.round(elem.h * bh)}px` : 'auto';
-    // Only clip horizontally — vertical overflow is worse than a little bleed
-    style.overflowY = 'visible';
+    style.overflow = 'visible';
+  } else {
+    style.overflow = 'hidden';
   }
 
   return style;
@@ -784,6 +805,12 @@ onUnmounted(() => {
   /* `wrap="none"` boxes must be allowed to bleed slightly (PowerPoint does the
      same), but never past the slide itself. */
   max-width: 100%;
+}
+
+.slide-bar {
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
 }
 
 .slide-para {

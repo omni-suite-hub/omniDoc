@@ -271,7 +271,7 @@ const DEFAULT_RELEASE_FEED =
   'https://api.github.com/repos/omni-suite-hub/omniDoc/releases/latest';
 
 const RELEASE_FEED_KEY = 'omnidoc_release_feed';
-const CURRENT_VERSION = '1.4.0';
+const CURRENT_VERSION = '1.5.0';
 
 /**
  * Pull a semver out of an arbitrary release tag.

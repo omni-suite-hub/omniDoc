@@ -327,6 +327,18 @@ export async function parsePptx(buffer) {
         }
       }
 
+      // BUG FIX: decorative hairline dividers were rendered as filled
+      // rectangles. Real decks (this one included) use very flat shapes
+      // (cy ≈ 0.01in, i.e. ~1px) purely as rules under a heading. Stretching
+      // those to their declared height produced huge grey slabs covering the
+      // content. Treat "much wider than tall" shapes as bars.
+      const THIN_BAR_RATIO = 0.02; // cy/cx below this reads as a rule
+      const isThinBar =
+        !sp.getElementsByTagName('a:p')[0] && // no text content
+        cx > 0 && cy > 0 &&
+        cy / cx < THIN_BAR_RATIO &&
+        cx > slideWidth * 0.05; // but wide enough to be intentional
+
       // Text paragraphs (<a:p>)
       const txBody = sp.getElementsByTagName('p:txBody')[0] || sp.getElementsByTagName('txBody')[0];
       const paragraphs = [];
@@ -518,13 +530,16 @@ export async function parsePptx(buffer) {
         }
 
         elements.push({
-          type: paragraphs.length > 0 ? 'text' : 'shape',
+          type: paragraphs.length > 0 ? 'text' : (isThinBar ? 'bar' : 'shape'),
           x: x / slideWidth,
           y: y / slideHeight,
           w: cx > 0 ? cx / slideWidth : 0.8,
           h: cy > 0 ? cy / slideHeight : 0.05,
           shapeFill,
           shapeBorder,
+          // Thickness in slide-height units, used by the renderer to draw
+          // hairline dividers instead of stretched rectangles
+          barThickness: isThinBar ? Math.max(cy / slideHeight, 0.0015) : null,
           paragraphs,
           insets,
           wrap,
