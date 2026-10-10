@@ -83,6 +83,77 @@ export async function parsePptx(buffer) {
     slidePaths = found;
   }
 
+  // ---- Contrast helpers -----------------------------------------------------
+  //
+  // BUG FIX (readability): some decks place body text on a saturated panel
+  // using a colour that only reaches ~3.4:1 against that panel — below the
+  // WCAG AA 4.5:1 floor for body copy. PowerPoint renders it as authored, so
+  // it is barely legible there too. We keep the deck's intent (the accent
+  // panel stays) but darken the *text* until it passes, which is a strict
+  // improvement over showing an unreadable slide.
+  function hexToRgb(hex) {
+    const h = String(hex || '').replace('#', '');
+    const full = h.length === 3 ? h.split('').map(c => c + c).join('') : h;
+    return {
+      r: parseInt(full.slice(0, 2), 16),
+      g: parseInt(full.slice(2, 4), 16),
+      b: parseInt(full.slice(4, 6), 16)
+    };
+  }
+
+  function relativeLuminance(hex) {
+    const { r, g, b } = hexToRgb(hex);
+    const f = (c) => {
+      const v = c / 255;
+      return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+  }
+
+  function contrastRatio(a, b) {
+    const la = relativeLuminance(a);
+    const lb = relativeLuminance(b);
+    const hi = Math.max(la, lb);
+    const lo = Math.min(la, lb);
+    return (hi + 0.05) / (lo + 0.05);
+  }
+
+  /** WCAG AA: 3.0 for large text (>=18.66px bold / 24px), 4.5 otherwise. */
+  function requiredRatio(sizePt, bold) {
+    const largePx = sizePt * (1280 / 960);
+    return largePx >= 24 || (bold && largePx >= 18.66) ? 3.0 : 4.5;
+  }
+
+  /**
+   * Nudge `fg` away from `bg` until it meets the required ratio.
+   * Moves along the lightness axis, which preserves hue and keeps the
+   * relationship to the deck's palette intact.
+   */
+  function ensureContrast(fg, bg, sizePt, bold) {
+    if (!fg || !bg) return fg;
+    const need = requiredRatio(sizePt, bold);
+    if (contrastRatio(fg, bg) >= need) return fg;
+
+    const bgL = relativeLuminance(bg);
+    // Dark text on a light panel → darken; otherwise lighten.
+    const goDark = bgL > 0.35;
+
+    const { r, g, b } = hexToRgb(fg);
+    let best = fg;
+
+    for (let step = 0; step < 22; step++) {
+      const k = step / 21; // 0 -> 1
+      const target = goDark ? 0 : 255;
+      const nr = Math.round(r + (target - r) * k);
+      const ng = Math.round(g + (target - g) * k);
+      const nb = Math.round(b + (target - b) * k);
+      const cand = `#${[nr, ng, nb].map(v => Math.max(0, Math.min(255, v)).toString(16).padStart(2, '0')).join('')}`;
+      if (contrastRatio(cand, bg) >= need) return cand;
+      best = cand;
+    }
+    return best;
+  }
+
   // Helper to extract color
   function extractColor(container, isDark) {
     if (!container) return isDark ? '#FFFFFF' : '#0F172A';
@@ -207,6 +278,8 @@ export async function parsePptx(buffer) {
     let slideTitle = '';
     let fallbackTitlePlaced = false;
     let fallbackContentRows = 0;
+    // Source order index, used to reproduce PowerPoint's stacking (z-order)
+    let zIdx = 0;
 
     const spTree = doc.getElementsByTagName('p:spTree')[0] || doc.getElementsByTagName('spTree')[0];
     const treeChildren = spTree ? Array.from(spTree.children) : Array.from(allShapes);
@@ -540,6 +613,14 @@ export async function parsePptx(buffer) {
           // Thickness in slide-height units, used by the renderer to draw
           // hairline dividers instead of stretched rectangles
           barThickness: isThinBar ? Math.max(cy / slideHeight, 0.0015) : null,
+          // BUG FIX: z-order. PowerPoint paints shapes in <p:spTree> order,
+          // so later shapes cover earlier ones. We render in the same order,
+          // but because we let text boxes grow beyond their declared height
+          // (to avoid clipping), a tall text box ended up underneath the
+          // decorative band that follows it and got painted over. Recording
+          // the source index lets the renderer keep the original stacking and
+          // additionally lift every text element above pure decoration.
+          zIndex: zIdx,
           paragraphs,
           insets,
           wrap,
@@ -547,6 +628,46 @@ export async function parsePptx(buffer) {
           fontScale,
           lnSpcReduction
         });
+        zIdx += 1;
+      }
+    }
+
+    // ---- Readability pass --------------------------------------------------
+    // For each text element find the filled panel it actually sits on (the
+    // largest fill whose rectangle contains the text box centre and was drawn
+    // earlier), then lift the text colour to WCAG AA if needed.
+    const textEls = elements.filter(e => e.paragraphs && e.paragraphs.length > 0);
+    const fillEls = elements.filter(e => e.shapeFill && e.type !== 'bar');
+
+    for (const t of textEls) {
+      const cx = t.x + t.w / 2;
+      const cy = t.y + t.h / 2;
+      let panel = slideBg;
+      let panelZ = -1;
+
+      for (const f of fillEls) {
+        if (f === t) continue;
+        // Containment: the text centre must fall inside the panel
+        if (cx < f.x || cx > f.x + f.w || cy < f.y || cy > f.y + f.h) continue;
+        // BUG FIX: panels are commonly stacked (a light accent under a solid
+        // cover). Picking the smallest one chose the hidden layer and the
+        // contrast was then checked against the wrong colour. The one painted
+        // last wins, because that is the one actually visible.
+        const z = f.zIndex ?? 0;
+        if (z > panelZ) {
+          panel = f.shapeFill;
+          panelZ = z;
+        }
+      }
+
+      if (!panel) continue;
+      t.backgroundHint = panel;
+
+      for (const p of t.paragraphs) {
+        for (const r of p.runs) {
+          if (!r.color) continue;
+          r.color = ensureContrast(r.color, panel, r.sizePt, r.bold);
+        }
       }
     }
 

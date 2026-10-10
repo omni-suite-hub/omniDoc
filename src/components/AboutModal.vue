@@ -149,7 +149,7 @@ const emit = defineEmits(['close', 'check-update', 'update-found']);
  * `getVersion()` from @tauri-apps/api/app is the supported API and reads
  * CFBundleShortVersionString from the bundle.
  */
-const FALLBACK_VERSION = '1.6.0';
+const FALLBACK_VERSION = '1.7.0';
 const currentVersion = ref(FALLBACK_VERSION);
 
 const isChecking = ref(false);

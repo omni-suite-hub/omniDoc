@@ -374,6 +374,7 @@ function getElementStyle(elem) {
     style.backgroundColor = elem.shapeFill || elem.shapeBorder || '#D8D7D0';
     style.border = 'none';
     style.overflow = 'visible';
+    style.zIndex = 100 + (elem.zIndex || 0);
     return style;
   }
 
@@ -384,12 +385,17 @@ function getElementStyle(elem) {
     style.border = `1px solid ${elem.shapeBorder}`;
   }
 
+  // BUG FIX (stacking): we let text boxes grow past their declared height so
+  // long copy is never clipped. PowerPoint instead relies on paint order, so
+  // a shape that follows a text box in <p:spTree> is painted over it — and our
+  // grown box ended up underneath decorative bands and got hidden.
+  // Text therefore always paints above decorations, while preserving the
+  // authored order among decorations themselves.
+  const hasText = elem.paragraphs && elem.paragraphs.length > 0;
+  style.zIndex = hasText ? 10000 + (elem.zIndex || 0) : (elem.zIndex || 0);
+
   // Text boxes must not clip their own content.
-  // BUG FIX: overflow used to be `hidden` on every element, so a large
-  // run (e.g. the 48pt "01" index, whose box is only 46px wide) was sliced
-  // in half. PowerPoint lets text overflow a nowrap box, so we clip nothing
-  // on text elements and only clamp images/decorative shapes.
-  if (elem.paragraphs && elem.paragraphs.length > 0) {
+  if (hasText) {
     style.height = 'auto';
     style.minHeight = elem.h ? `${Math.round(elem.h * bh)}px` : 'auto';
     style.overflow = 'visible';
