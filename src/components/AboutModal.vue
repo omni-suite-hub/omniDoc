@@ -23,6 +23,7 @@
         <div class="update-header-row">
           <div class="update-status-title">
             <span v-if="isChecking" class="status-indicator checking"></span>
+            <span v-else-if="isDownloading" class="status-indicator downloading"></span>
             <span v-else-if="hasUpdate" class="status-indicator available"></span>
             <span v-else-if="checkFailed" class="status-indicator unknown"></span>
             <span v-else class="status-indicator latest"></span>
@@ -33,6 +34,7 @@
           </div>
 
           <button 
+            v-if="!isDownloading"
             class="check-btn" 
             :disabled="isChecking"
             @click="handleCheckUpdate"
@@ -40,16 +42,44 @@
             <span v-if="isChecking">正在检查...</span>
             <span v-else>检查更新</span>
           </button>
+          <button 
+            v-else
+            class="check-btn"
+            @click="handleCancelDownload"
+          >
+            取消
+          </button>
         </div>
 
         <!-- Update details if available -->
-        <div v-if="hasUpdate" class="update-detail-card">
-<div class="detail-version">新版本：v{{ activeUpdateInfo?.latestVersion }} · {{ activeUpdateInfo?.releaseDate }}</div>
+        <div v-if="hasUpdate || isDownloading" class="update-detail-card">
+          <div class="detail-version">新版本：v{{ activeUpdateInfo?.latestVersion }} · {{ activeUpdateInfo?.releaseDate }}</div>
           <div class="detail-notes">{{ activeUpdateInfo?.releaseNotes || '性能优化，修复已知问题并提升稳定性。' }}</div>
-<button class="download-cta-btn" @click="handleDownload">
+
+          <!-- Download progress -->
+          <div v-if="isDownloading" class="download-progress-wrap">
+            <div class="progress-track" role="progressbar" :aria-valuenow="Math.round(downloadPercent)" aria-valuemin="0" aria-valuemax="100">
+              <div class="progress-fill" :style="{ width: downloadPercent + '%' }"></div>
+            </div>
+            <div class="progress-meta">
+              <span>{{ progressLabel }}</span>
+              <span v-if="downloadPercent > 0">{{ Math.round(downloadPercent) }}%</span>
+            </div>
+          </div>
+
+          <!-- Primary action: install in-app when a real binary exists -->
+          <button 
+            v-if="!isDownloading"
+            class="download-cta-btn"
+            @click="handleInstallUpdate"
+          >
             <Download class="dl-icon" />
-            <span>前往下载页</span>
+            <span>{{ canInstallInApp ? '下载并安装' : '前往下载页' }}</span>
           </button>
+
+          <p v-if="!isDownloading && canInstallInApp" class="install-hint">
+            安装将自动完成，应用会重启一次
+          </p>
         </div>
       </div>
 
@@ -86,9 +116,15 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 import { getVersion } from '@tauri-apps/api/app';
-import { openExternalUrl, checkAppUpdate } from '../utils/fileHandler.js';
+import {
+  openExternalUrl,
+  checkAppUpdate,
+  downloadUpdatePackage,
+  installUpdatePackage,
+  formatFileSize
+} from '../utils/fileHandler.js';
 import { X, Download, Zap, ShieldCheck, Layers } from 'lucide-vue-next';
 
 const props = defineProps({
@@ -113,7 +149,7 @@ const emit = defineEmits(['close', 'check-update', 'update-found']);
  * `getVersion()` from @tauri-apps/api/app is the supported API and reads
  * CFBundleShortVersionString from the bundle.
  */
-const FALLBACK_VERSION = '1.5.0';
+const FALLBACK_VERSION = '1.6.0';
 const currentVersion = ref(FALLBACK_VERSION);
 
 const isChecking = ref(false);
@@ -123,6 +159,24 @@ const hasUpdate = ref(false);
 const checkFailed = ref(false);
 const statusMessage = ref('OmniDoc 已是最新版本');
 const activeUpdateInfo = ref(props.updateInfo || null);
+
+// --- In-app install state ---
+const isDownloading = ref(false);
+const downloadPercent = ref(0);
+const downloadBytes = ref(0);
+let cancelRequested = false;
+
+/** A real .dmg asset exists, so we can install without leaving the app. */
+const canInstallInApp = computed(
+  () => !!(activeUpdateInfo.value?.installerUrl)
+);
+
+const progressLabel = computed(() => {
+  if (downloadPercent.value >= 100 || downloadBytes.value === 0) {
+    return downloadPercent.value >= 100 ? '下载完成，正在安装...' : '正在连接...';
+  }
+  return `正在下载 ${formatFileSize(downloadBytes.value)}...`;
+});
 
 onMounted(async () => {
   try {
@@ -188,6 +242,79 @@ function handleDownload() {
   const url = activeUpdateInfo.value?.downloadUrl;
   if (!url) return;
   openExternalUrl(url);
+}
+
+/**
+ * Download the new build and install it without leaving the app.
+ *
+ * Previously this only opened the GitHub release page, which meant the user
+ * had to download, mount, and copy the DMG by hand. Now the app does all of
+ * that: it downloads to a temp file (with progress), then hands off to a
+ * detached installer that waits for us to quit before swapping the bundle.
+ */
+async function handleInstallUpdate() {
+  const info = activeUpdateInfo.value;
+  if (!info?.installerUrl) {
+    // No binary attached to the release — fall back to the web page.
+    handleDownload();
+    return;
+  }
+
+  cancelRequested = false;
+  isDownloading.value = true;
+  downloadPercent.value = 0;
+  downloadBytes.value = 0;
+  statusMessage.value = `正在下载 v${info.latestVersion}...`;
+
+  let dmgPath = null;
+  try {
+    dmgPath = await downloadUpdatePackage(
+      info.installerUrl,
+      info.installerName || 'OmniDoc.dmg',
+      (p) => {
+        if (cancelRequested) return;
+        downloadBytes.value = p.downloaded || 0;
+        // With an unknown total, curl-style downloads report 0; fall back to
+        // a byte-based heuristic so the bar still moves.
+        if (p.total > 0) {
+          downloadPercent.value = p.percent;
+        } else if (info.installerSize > 0) {
+          downloadPercent.value = Math.min(
+            99,
+            ((p.downloaded || 0) / info.installerSize) * 100
+          );
+        }
+      }
+    );
+
+    if (cancelRequested) {
+      statusMessage.value = '已取消下载';
+      isDownloading.value = false;
+      return;
+    }
+
+    downloadPercent.value = 100;
+    statusMessage.value = '正在安装，应用将重启...';
+
+    // This call returns immediately; the app quits a moment later.
+    await installUpdatePackage(dmgPath, 'OmniDoc');
+  } catch (e) {
+    console.error('Update install failed:', e);
+    isDownloading.value = false;
+    checkFailed.value = true;
+    const reason = e && typeof e === 'string' ? e.replace(/^Error:\s*/, '') : '';
+    statusMessage.value = reason
+      ? `安装失败：${reason}`
+      : '安装失败，请前往下载页手动更新';
+  }
+}
+
+function handleCancelDownload() {
+  cancelRequested = true;
+  isDownloading.value = false;
+  downloadPercent.value = 0;
+  downloadBytes.value = 0;
+  statusMessage.value = '已取消下载';
 }
 </script>
 
@@ -363,6 +490,51 @@ function handleDownload() {
 /* "We could not determine" — amber, not green, so it never reads as "up to date" */
 .status-indicator.unknown {
   background: #D97706;
+}
+
+.status-indicator.downloading {
+  background: #2563EB;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* Download progress */
+.download-progress-wrap {
+  margin-top: 14px;
+}
+
+.progress-track {
+  height: 6px;
+  border-radius: 999px;
+  background: #E2E8F0;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2563EB, #3B82F6);
+  transition: width 0.25s ease-out;
+}
+
+.progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 7px;
+  font-size: 11.5px;
+  color: #64748B;
+}
+
+.install-hint {
+  margin: 9px 0 0;
+  font-size: 11.5px;
+  color: #94A3B8;
+  text-align: center;
 }
 
 .status-msg {

@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 
 export const SUPPORTED_EXTENSIONS = {
   // Documents
@@ -271,7 +272,7 @@ const DEFAULT_RELEASE_FEED =
   'https://api.github.com/repos/omni-suite-hub/omniDoc/releases/latest';
 
 const RELEASE_FEED_KEY = 'omnidoc_release_feed';
-const CURRENT_VERSION = '1.5.0';
+const CURRENT_VERSION = '1.6.0';
 
 /**
  * Pull a semver out of an arbitrary release tag.
@@ -343,13 +344,27 @@ export async function checkAppUpdate() {
     const isPrerelease = data.prerelease === true;
     const newer = !isPrerelease && compareVersions(latest, CURRENT_VERSION) > 0;
 
+    // Prefer the actual DMG asset so the update can be installed in-app;
+    // fall back to the release page when no binary is attached.
+    const asset =
+      Array.isArray(data.assets)
+        ? data.assets.find(a => /\.dmg$/i.test(a.name || ''))
+        : null;
+    const downloadUrl = asset ? asset.browser_download_url : '';
+    const assetName = asset ? asset.name : '';
+
     return {
       currentVersion: CURRENT_VERSION,
       hasUpdate: newer,
       latestVersion: latest,
       releaseDate: data.published_at ? data.published_at.slice(0, 10) : '',
       releaseNotes: data.body || '',
-      downloadUrl: data.html_url || ''
+      downloadUrl: data.html_url || '',
+      // Present only when a real binary can be fetched — the modal uses this
+      // to decide between "install now" and "open release page".
+      installerUrl: downloadUrl,
+      installerName: assetName,
+      installerSize: asset ? asset.size : 0
     };
   } catch (e) {
     console.warn('Update check failed:', e);
@@ -492,4 +507,45 @@ export async function loadDocumentFromFileObject(file) {
       extension: ext
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// In-app update installation
+// ---------------------------------------------------------------------------
+
+/**
+ * Download an update package. `onProgress` receives
+ * { downloaded, total, percent } as the Rust side streams progress.
+ */
+export async function downloadUpdatePackage(url, filename, onProgress) {
+  let unlisten = null;
+  if (onProgress && typeof window !== 'undefined') {
+    unlisten = await listen('update-progress', (event) => {
+      try {
+        onProgress(event.payload);
+      } catch (e) {
+        /* listener errors must not break the download */
+      }
+    });
+  }
+
+  try {
+    return await invoke('download_update', { url, filename });
+  } finally {
+    if (unlisten) {
+      try {
+        unlisten();
+      } catch (e) {
+        /* already gone */
+      }
+    }
+  }
+}
+
+/**
+ * Replace the current app with the downloaded package and relaunch.
+ * The app quits as part of this, so callers must not do more work afterwards.
+ */
+export async function installUpdatePackage(dmgPath, appName = 'OmniDoc') {
+  await invoke('install_update', { dmgPath, appName });
 }

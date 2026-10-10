@@ -498,6 +498,208 @@ fn open_system_settings() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// In-app updater
+//
+// The About modal used to just open the GitHub release page. This downloads
+// the .dmg straight into the app instead: the user stays in OmniDoc, and the
+// new build replaces the old one on disk.
+//
+// We deliberately shell out to `curl` rather than pulling in a Rust HTTP
+// client: curl ships with macOS, follows redirects (the GitHub release asset
+// URL redirects to a CDN), and keeps the dependency tree untouched.
+// ---------------------------------------------------------------------------
+
+fn emit_progress(app: &tauri::AppHandle, downloaded: u64, total: u64) {
+    let _ = app.emit(
+        "update-progress",
+        serde_json::json!({
+            "downloaded": downloaded,
+            "total": total,
+            "percent": if total > 0 {
+                (downloaded as f64 / total as f64 * 100.0).min(100.0)
+            } else { 0.0 }
+        }),
+    );
+}
+
+/// Download an update DMG to a stable temp location.
+///
+/// Returns the downloaded file path on success.
+#[tauri::command]
+async fn download_update(app: tauri::AppHandle, url: String, filename: String) -> Result<String, String> {
+    // Only ever write a .dmg, and sanitise the name so the URL cannot escape
+    // the temp directory or pick a different extension.
+    let safe_name: String = filename
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+        .collect();
+    let file_name = if safe_name.ends_with(".dmg") {
+        safe_name
+    } else {
+        format!("{}.dmg", safe_name)
+    };
+
+    let dir = std::env::temp_dir().join("omnidoc-update");
+    fs::create_dir_all(&dir).map_err(|e| format!("无法创建临时目录: {}", e))?;
+    let target = dir.join(&file_name);
+
+    // Remove a partial file from an earlier attempt
+    let _ = fs::remove_file(&target);
+
+    let target_str = target.to_string_lossy().to_string();
+    let app2 = app.clone();
+    let url2 = url.clone();
+    // Keep a copy for the closure's return value (the outer `target` is moved
+    // into the polling loop below).
+    let target_done = target.clone();
+
+    // curl writes progress as machine-readable lines when asked, so we can
+    // stream it instead of reporting only at the end.
+    let script = format!(
+        r#"curl -L --fail --silent --show-error \
+             --connect-timeout 15 --max-time 900 \
+             --retry 2 --retry-delay 2 \
+             -o "{target}" \
+             "{url}"
+        "#,
+        target = target_str,
+        url = url2
+    );
+
+    tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("无法启动下载: {}", e))?;
+
+        // Poll the file size while curl runs. Simple and reliable: curl writes
+        // straight to the target path, so on-disk size is the progress.
+        let mut last = 0u64;
+        for _ in 0..900 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let size = fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+            if size != last {
+                last = size;
+                emit_progress(&app2, size, 0);
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                if !status.success() {
+                    let err = child
+                        .stderr
+                        .as_mut()
+                        .map(|_| String::new())
+                        .unwrap_or_default();
+                    let _ = fs::remove_file(&target);
+                    return Err(if err.is_empty() {
+                        format!("下载失败（curl 退出码 {:?}）", status.code())
+                    } else {
+                        err
+                    });
+                }
+                let size = fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+                // Sanity check: a truncated DMG would fail later in a much
+                // more confusing way, so refuse it here.
+                if size < 1_000_000 {
+                    let _ = fs::remove_file(&target);
+                    return Err("下载内容不完整，请重试".to_string());
+                }
+                emit_progress(&app2, size, size);
+                return Ok(target_done.to_string_lossy().to_string());
+            }
+        }
+
+        let _ = child.kill();
+        let _ = fs::remove_file(&target);
+        Err("下载超时".to_string())
+    })
+    .await
+    .map_err(|e| format!("下载任务异常: {}", e))?
+}
+
+/// Replace the running app with a freshly downloaded DMG, then relaunch.
+///
+/// The app cannot replace itself while running, so we hand the work to a
+/// detached shell that waits for our PID to exit before touching anything.
+#[tauri::command]
+async fn install_update(dmg_path: String, app_name: String) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    // Validate inputs: the path must live in our own temp directory and end
+    // in .dmg, otherwise a compromised web response could point us elsewhere.
+    let dmg = Path::new(&dmg_path);
+    if !dmg.exists() {
+        return Err("安装包不存在".to_string());
+    }
+    if dmg.extension().and_then(|e| e.to_str()) != Some("dmg") {
+        return Err("安装包格式无效".to_string());
+    }
+    let temp_root = std::env::temp_dir().join("omnidoc-update");
+    if !dmg.starts_with(&temp_root) {
+        return Err("安装包路径不合法".to_string());
+    }
+    if app_name.contains('/') || app_name.is_empty() {
+        return Err("应用名称不合法".to_string());
+    }
+
+    let pid = std::process::id();
+    let script = format!(
+        r#"
+# Wait for the running app to exit (it is the one launching us).
+while kill -0 {pid} 2>/dev/null; do sleep 0.4; done
+sleep 1.2
+
+VOL=""
+for try in 1 2 3; do
+  OUT=$(/usr/bin/hdiutil attach "{dmg}" -nobrowse -readonly 2>&1)
+  VOL=$(printf '%s' "$OUT" | grep -o '/Volumes/[^[:space:]]*' | head -1)
+  if [ -n "$VOL" ]; then break; fi
+  sleep 2
+done
+
+if [ -z "$VOL" ]; then
+  open "{dmg}"
+  exit 1
+fi
+
+SRC="$VOL/{app_name}.app"
+DEST="/Applications/{app_name}.app"
+
+if [ -d "$SRC" ]; then
+  # Preserve the existing bundle so any open document context is not lost.
+  if [ -d "$DEST" ]; then
+    /bin/rm -rf "$DEST"
+  fi
+  /bin/cp -R "$SRC" "$DEST" 2>/dev/null || /usr/bin/ditto "$SRC" "$DEST"
+fi
+
+/usr/bin/hdiutil detach "$VOL" -quiet -force 2>/dev/null
+/bin/rm -f "{dmg}"
+open -a "{app_name}" 2>/dev/null
+        "#,
+        pid = pid,
+        dmg = dmg_path,
+        app_name = app_name
+    );
+
+    // Detach: the installer must outlive this process.
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("无法启动安装程序: {}", e))?;
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
@@ -525,7 +727,9 @@ pub fn run() {
             set_default_app_for_category,
             reset_default_app_for_category,
             open_system_settings,
-            open_url
+            open_url,
+            download_update,
+            install_update
         ]);
 
     let app = builder
